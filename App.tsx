@@ -1,89 +1,152 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { createRoot } from 'react-dom/client';
-import { AppState, Artwork, TourPlan, Curiosity } from './types';
-import { generateTourPlan, getArtworkDetailsWithCache, getAudioSpeechWithCache, replanTour } from './services/geminiService';
-import { AudioPlayer } from './components/AudioPlayer';
+import { AppState, Artwork, TourPlan, Curiosity, UserProfile, AudioState, DetailLevel, ArtworkContent, UserPacing } from './types';
+import { generateTourPlan, getArtworkDetailsWithCache, getAudioSpeechWithCache } from './services/geminiService';
+import { GlobalAudioPlayer } from './components/GlobalAudioPlayer';
 import { Timeline } from './components/Timeline';
-
-const FLORENCE_BG = "https://images.unsplash.com/photo-1543429786-ed40b3cf60d6?q=80&w=2000&auto=format&fit=crop"; 
+import { Onboarding } from './components/Onboarding';
+import { ImageWithLoader } from './components/ImageWithLoader';
+import { InteractiveMap } from './components/InteractiveMap';
 
 const App: React.FC = () => {
-    const [state, setState] = useState<AppState>(AppState.SETUP);
-    const [initialDuration, setInitialDuration] = useState<number>(120); // Default 2 hours
+    // APP STATE
+    const [state, setState] = useState<AppState>(AppState.ONBOARDING);
+    const [profile, setProfile] = useState<UserProfile | null>(null);
     const [plan, setPlan] = useState<TourPlan | null>(null);
-    const [currentDetails, setCurrentDetails] = useState<{ fullContent: string, curiosities: Curiosity[], connectionContext: string } | null>(null);
-    const [currentAudio, setCurrentAudio] = useState<string | null>(null);
-    const [loadingDetail, setLoadingDetail] = useState(false);
     const [error, setError] = useState<string | null>(null);
-    
-    // Replanning state
-    const [showReplan, setShowReplan] = useState(false);
-    const [replanTime, setReplanTime] = useState(60);
-    const [isReplanning, setIsReplanning] = useState(false);
 
-    // Curiosity Modal State
-    const [selectedCuriosity, setSelectedCuriosity] = useState<Curiosity | null>(null);
+    // CONTENT STATE
+    // We store the full multi-level content object here
+    const [contentData, setContentData] = useState<ArtworkContent | null>(null);
+    const [detailLevel, setDetailLevel] = useState<DetailLevel>(DetailLevel.MEDIUM);
+    const [isLoadingDetails, setIsLoadingDetails] = useState(false);
 
-    // ---- SETUP PHASE ----
-    const handleStartTour = async () => {
+    // GLOBAL AUDIO STATE
+    const [audioState, setAudioState] = useState<AudioState>({
+        currentTrack: null,
+        isPlaying: false,
+        isLoading: false
+    });
+
+    // 1. HANDLE ONBOARDING COMPLETION
+    const handleOnboardingComplete = async (userProfile: UserProfile) => {
+        setProfile(userProfile);
+        setDetailLevel(userProfile.defaultDetailLevel); // Set default from profile if we added it there, or just default to MEDIUM
         setState(AppState.LOADING_PLAN);
         try {
-            const artworks = await generateTourPlan(initialDuration);
+            const artworks = await generateTourPlan(userProfile);
             setPlan({
-                totalDurationMinutes: initialDuration,
+                totalDurationMinutes: userProfile.availableTime,
                 artworks,
                 currentIndex: 0
             });
             setState(AppState.TOUR);
         } catch (e) {
             console.error(e);
-            setError("Impossibile generare il tour. Controlla la connessione.");
+            setError("Errore nella generazione del tour.");
             setState(AppState.ERROR);
         }
     };
 
-    // ---- LOADING DETAILS FOR CURRENT STOP ----
-    const loadCurrentStopDetails = useCallback(async () => {
-        if (!plan) return;
-        const artwork = plan.artworks[plan.currentIndex];
-        const prevArtwork = plan.currentIndex > 0 ? plan.artworks[plan.currentIndex - 1] : undefined;
+    // 2. HELPER: Get Text based on Level
+    const getCurrentText = (data: ArtworkContent, level: DetailLevel): string => {
+        switch(level) {
+            case DetailLevel.SHORT: return data.short;
+            case DetailLevel.LONG: return data.long;
+            case DetailLevel.MEDIUM: default: return data.medium;
+        }
+    };
+
+    // 3. LOAD ARTWORK CONTENT (TEXT + AUDIO)
+    const loadContentForIndex = useCallback(async (index: number) => {
+        if (!plan || !profile) return;
         
-        // Reset 
-        setLoadingDetail(true);
+        setIsLoadingDetails(true);
+        const artwork = plan.artworks[index];
+        const prev = index > 0 ? plan.artworks[index - 1] : undefined;
 
         try {
-            // 1. Get Text Content (Cached)
-            const details = await getArtworkDetailsWithCache(artwork, prevArtwork);
-            setCurrentDetails(details);
-            
-            // Clear audio temporarily to show loading state specifically for audio if needed
-            setCurrentAudio(null);
+            // Fetch structured content (S/M/L)
+            const data = await getArtworkDetailsWithCache(artwork, profile, prev);
+            setContentData(data);
 
-            // 2. Generate Audio (Cached)
-            // Combine connection text + main content for a seamless audio experience
-            const fullAudioText = `${details.connectionContext} ... ${details.fullContent}`;
-            const audioBase64 = await getAudioSpeechWithCache(fullAudioText, artwork.id);
-            setCurrentAudio(audioBase64);
-            
+            // Play Audio for the current Detail Level
+            await playAudioForLevel(data, detailLevel, artwork);
+
         } catch (e) {
-            console.error("Error loading details", e);
+            console.error(e);
         } finally {
-            setLoadingDetail(false);
+            setIsLoadingDetails(false);
         }
-    }, [plan]);
+    }, [plan, profile, detailLevel]);
 
+    const playAudioForLevel = async (data: ArtworkContent, level: DetailLevel, artwork: Artwork) => {
+        const textToRead = `${data.connectionContext} ... ${getCurrentText(data, level)}`;
+        
+        setAudioState(prev => ({ ...prev, isLoading: true }));
+        try {
+            const audioBase64 = await getAudioSpeechWithCache(textToRead, `${artwork.id}_${level}`);
+            
+            setAudioState({
+                isLoading: false,
+                isPlaying: true,
+                currentTrack: {
+                    id: artwork.id,
+                    title: artwork.title,
+                    artist: artwork.artist,
+                    imageUrl: artwork.imageUrl,
+                    url: audioBase64
+                }
+            });
+        } catch (e) {
+            console.error("Audio fail", e);
+            setAudioState(prev => ({ ...prev, isLoading: false }));
+        }
+    };
+
+    // Trigger load when index changes
     useEffect(() => {
         if (state === AppState.TOUR && plan) {
-            loadCurrentStopDetails();
+            loadContentForIndex(plan.currentIndex);
         }
-    }, [plan?.currentIndex, state]); 
+    }, [plan?.currentIndex, state]);
 
-    // ---- NAVIGATION ----
-    const handleJumpTo = (index: number) => {
-        if(!plan) return;
-        setPlan({ ...plan, currentIndex: index });
-    }
+    // Handle Detail Level Change (Granular Control)
+    const handleLevelChange = async (newLevel: DetailLevel) => {
+        setDetailLevel(newLevel);
+        if (contentData && plan) {
+             // Immediately switch audio
+             await playAudioForLevel(contentData, newLevel, plan.artworks[plan.currentIndex]);
+        }
+    };
 
+    // HANDLE CURIOSITY CLICK
+    const handleCuriosityClick = async (c: Curiosity) => {
+        if (!plan || !contentData) return;
+        const currentArt = plan.artworks[plan.currentIndex];
+
+        setAudioState(prev => ({ ...prev, isLoading: true }));
+        try {
+            const audioBase64 = await getAudioSpeechWithCache(c.description, `curiosity_${currentArt.id}_${c.title}`);
+            setAudioState({
+                isLoading: false,
+                isPlaying: true,
+                currentTrack: {
+                    id: `curiosity_${c.title}`,
+                    title: `Curiosità: ${c.title}`,
+                    artist: currentArt.title, 
+                    imageUrl: currentArt.imageUrl,
+                    url: audioBase64,
+                    isCuriosity: true
+                }
+            });
+        } catch (e) {
+            console.error(e);
+            setAudioState(prev => ({ ...prev, isLoading: false }));
+        }
+    };
+
+    // NAVIGATION
     const handleNext = () => {
         if (!plan) return;
         if (plan.currentIndex < plan.artworks.length - 1) {
@@ -98,321 +161,154 @@ const App: React.FC = () => {
         }
     };
 
-    const handleReplan = async () => {
-        if (!plan) return;
-        setIsReplanning(true);
-        try {
-            const remaining = plan.artworks.slice(plan.currentIndex + 1);
-            const newRoute = await replanTour(remaining, replanTime);
-            
-            const newArtworks = [
-                ...plan.artworks.slice(0, plan.currentIndex + 1),
-                ...newRoute
-            ];
-            
-            setPlan({
-                ...plan,
-                artworks: newArtworks
-            });
-            setShowReplan(false);
-        } catch (e) {
-            console.error(e);
-            alert("Errore nell'aggiornamento.");
-        } finally {
-            setIsReplanning(false);
-        }
+    const handleJumpTo = (index: number) => {
+        if(!plan) return;
+        setPlan({ ...plan, currentIndex: index });
+        setState(AppState.TOUR);
     };
 
-    // ---- RENDERERS ----
+    const handleMapSelect = (id: string) => {
+        if(!plan) return;
+        const idx = plan.artworks.findIndex(a => a.id === id);
+        if (idx !== -1) handleJumpTo(idx);
+    };
 
-    if (state === AppState.ERROR) {
+    // RENDER STATES
+    if (state === AppState.ONBOARDING) return <Onboarding onComplete={handleOnboardingComplete} />;
+    
+    if (state === AppState.LOADING_PLAN) return (
+        <div className="min-h-screen flex flex-col items-center justify-center bg-stone-50 font-serif">
+            <div className="w-16 h-16 border-4 border-stone-200 border-t-red-800 rounded-full animate-spin mb-4"></div>
+            <h2 className="text-xl text-stone-800">Creazione Itinerario Personalizzato...</h2>
+        </div>
+    );
+
+    if (state === AppState.MAP_VIEW && plan) {
         return (
-            <div className="min-h-screen flex items-center justify-center p-4 bg-stone-100 text-center font-serif">
-                <div className="bg-white p-8 rounded shadow-xl">
-                    <h1 className="text-2xl font-bold text-red-800 mb-2">Errore</h1>
-                    <p className="text-stone-600 mb-4">{error}</p>
-                    <button onClick={() => window.location.reload()} className="px-6 py-2 bg-stone-800 text-white rounded hover:bg-stone-700">Riprova</button>
-                </div>
-            </div>
+            <InteractiveMap 
+                artworks={plan.artworks} 
+                currentArtworkId={plan.artworks[plan.currentIndex].id} 
+                onSelectArtwork={handleMapSelect} 
+                onClose={() => setState(AppState.TOUR)}
+            />
         );
     }
 
-    if (state === AppState.SETUP) {
-        return (
-            <div 
-                className="min-h-screen bg-cover bg-center flex items-center justify-center p-4 relative"
-                style={{ backgroundImage: `url('${FLORENCE_BG}')` }}
-            >
-                <div className="absolute inset-0 bg-black/40 backdrop-blur-sm"></div>
-                <div className="relative bg-white/95 backdrop-blur-xl p-8 rounded-2xl shadow-2xl max-w-md w-full border-t-8 border-red-800 animate-fade-in">
-                    <div className="text-center mb-6">
-                        <i className="fas fa-landmark text-4xl text-red-800 mb-2"></i>
-                        <h1 className="text-5xl font-serif text-stone-900 mb-2">Uffizi</h1>
-                        <p className="text-stone-500 font-light tracking-widest uppercase text-sm">Smart Audio Guide</p>
-                    </div>
-                    
-                    <div className="space-y-8">
-                        <div className="bg-stone-50 p-4 rounded-xl border border-stone-200">
-                            <label className="block text-sm font-bold text-stone-700 mb-4 flex justify-between">
-                                <span>Tempo a disposizione</span>
-                                <span className="text-red-800 font-mono text-lg">{Math.floor(initialDuration / 60)}h {(initialDuration % 60) > 0 ? (initialDuration % 60) + 'm' : ''}</span>
-                            </label>
-                            <input 
-                                type="range" 
-                                min="30" 
-                                max="240" 
-                                step="15"
-                                value={initialDuration}
-                                onChange={(e) => setInitialDuration(parseInt(e.target.value))}
-                                className="w-full h-2 bg-stone-300 rounded-lg appearance-none cursor-pointer accent-red-800 hover:accent-red-900 transition-all"
-                            />
-                            <div className="flex justify-between text-xs text-stone-400 mt-2 font-mono">
-                                <span>30m</span>
-                                <span>4h</span>
-                            </div>
-                        </div>
+    if (state === AppState.ERROR) return <div className="p-10 text-center text-red-800">{error}</div>;
 
-                        <button 
-                            onClick={handleStartTour}
-                            className="w-full py-4 bg-red-900 hover:bg-red-950 text-white rounded-xl font-serif font-bold text-xl transition shadow-lg hover:shadow-xl transform hover:-translate-y-1 flex items-center justify-center gap-3"
-                        >
-                            <span>Entra nel Museo</span>
-                        </button>
-                    </div>
-                </div>
-            </div>
-        );
-    }
-
-    if (state === AppState.LOADING_PLAN) {
-        return (
-            <div className="min-h-screen flex flex-col items-center justify-center bg-stone-50 font-serif">
-                <div className="relative">
-                    <div className="w-16 h-16 border-4 border-stone-200 border-t-red-800 rounded-full animate-spin"></div>
-                    <i className="fas fa-paint-brush absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 text-stone-400"></i>
-                </div>
-                <h2 className="text-2xl mt-6 text-stone-800">Creazione Itinerario...</h2>
-                <p className="text-stone-500 mt-2 font-sans text-sm">Stiamo curando la selezione delle opere per te.</p>
-            </div>
-        );
-    }
-
-    // ---- TOUR VIEW ----
     if (!plan) return null;
     const currentArtwork = plan.artworks[plan.currentIndex];
 
-    // Fallback image if real one is missing or empty
-    const displayImage = currentArtwork.imageUrl && currentArtwork.imageUrl.length > 10 
-        ? currentArtwork.imageUrl 
-        : `https://picsum.photos/seed/${currentArtwork.id}/800/600`; 
-
     return (
-        <div className="min-h-screen bg-stone-100 flex flex-col font-sans">
+        <div className="min-h-screen bg-stone-100 flex flex-col font-sans pb-24"> 
             
-            {/* Top Interactive Timeline */}
-            <div className="sticky top-0 z-40 bg-stone-900 shadow-md">
-                <Timeline 
-                    artworks={plan.artworks} 
-                    currentIndex={plan.currentIndex} 
-                    onSelect={handleJumpTo} 
-                />
+            {/* Header / Timeline */}
+            <div className="sticky top-0 z-30 bg-stone-900 shadow-md">
+                <Timeline artworks={plan.artworks} currentIndex={plan.currentIndex} onSelect={handleJumpTo} />
             </div>
 
-            <main className="flex-1 max-w-4xl mx-auto w-full p-4 md:p-6 pb-40">
-                
-                {/* Historical Bridge / Context Header */}
-                <div className="mb-6 p-4 bg-yellow-50 border border-yellow-200 rounded-lg shadow-sm flex gap-4 items-start animate-fade-in">
-                    <div className="bg-yellow-100 p-2 rounded-full text-yellow-700 mt-1">
-                        <i className="fas fa-link"></i>
-                    </div>
-                    <div>
-                        <h4 className="text-xs font-bold text-yellow-800 uppercase tracking-wide mb-1">Il Filo Conduttore</h4>
-                        <p className="text-stone-700 italic text-sm leading-relaxed">
-                             {loadingDetail ? "Analisi del contesto storico..." : currentDetails?.connectionContext || "Inizio del percorso."}
-                        </p>
-                    </div>
-                </div>
+            {/* View Switcher Bar */}
+            <div className="bg-white border-b border-stone-200 px-4 py-2 flex justify-between items-center shadow-sm z-20">
+                 <div className="text-xs font-bold text-stone-500 uppercase tracking-widest">
+                     Sala {currentArtwork.room}
+                 </div>
+                 <button 
+                    onClick={() => setState(AppState.MAP_VIEW)}
+                    className="flex items-center gap-2 bg-stone-100 text-stone-700 px-4 py-2 rounded-full text-xs font-bold hover:bg-stone-200 transition"
+                 >
+                     <i className="fas fa-map"></i> Mappa
+                 </button>
+            </div>
 
-                {/* Main Artwork Card */}
-                <div className="bg-white rounded-2xl shadow-xl overflow-hidden border border-stone-200">
+            {/* MAIN CONTENT AREA */}
+            <main className="flex-1 max-w-4xl mx-auto w-full p-4 md:p-6 animate-fade-in">
+                <div className="bg-white rounded-2xl shadow-sm border border-stone-200 overflow-hidden mb-6">
                     
-                    {/* Image Section */}
-                    <div className="relative aspect-video md:aspect-[21/9] bg-stone-800 group overflow-hidden">
-                        <img 
-                            src={displayImage} 
-                            alt={currentArtwork.title} 
-                            className="w-full h-full object-contain md:object-cover transition duration-1000 group-hover:scale-105 opacity-90 group-hover:opacity-100"
-                        />
-                        <div className="absolute inset-0 bg-gradient-to-t from-black/90 via-transparent to-transparent"></div>
-                        
-                        <div className="absolute bottom-0 left-0 p-6 md:p-8 text-white">
-                            <div className="inline-block bg-red-800 text-white text-xs px-2 py-1 rounded mb-2 font-bold uppercase tracking-wider">
-                                Sala {currentArtwork.room}
-                            </div>
-                            <h1 className="text-3xl md:text-5xl font-serif font-bold leading-tight mb-1">{currentArtwork.title}</h1>
-                            <p className="text-xl md:text-2xl text-stone-300 font-serif italic">{currentArtwork.artist}</p>
-                            <p className="text-sm text-stone-400 mt-2">{currentArtwork.period}</p>
-                        </div>
+                    {/* Image */}
+                    <div className="aspect-[4/3] md:aspect-[21/9]">
+                        <ImageWithLoader src={currentArtwork.imageUrl} alt={currentArtwork.title} className="w-full h-full" />
                     </div>
 
-                    {/* Content Section */}
-                    <div className="p-6 md:p-10 space-y-8">
-                        
-                        {loadingDetail ? (
-                             <div className="space-y-4 animate-pulse">
-                                <div className="h-4 bg-stone-200 rounded w-full"></div>
-                                <div className="h-4 bg-stone-200 rounded w-5/6"></div>
-                                <div className="h-4 bg-stone-200 rounded w-4/6"></div>
+                    <div className="p-6">
+                        <h1 className="text-2xl font-serif font-bold text-stone-900 leading-tight mb-1">{currentArtwork.title}</h1>
+                        <p className="text-stone-500 italic mb-6">{currentArtwork.artist}, {currentArtwork.period}</p>
+
+                        {/* Granular Detail Control */}
+                        <div className="flex bg-stone-100 p-1 rounded-lg mb-6">
+                            {[
+                                { id: DetailLevel.SHORT, label: 'Essenziale', icon: 'fa-bolt' },
+                                { id: DetailLevel.MEDIUM, label: 'Standard', icon: 'fa-align-left' },
+                                { id: DetailLevel.LONG, label: 'Approfondito', icon: 'fa-book-open' },
+                            ].map((opt) => (
+                                <button
+                                    key={opt.id}
+                                    onClick={() => handleLevelChange(opt.id)}
+                                    className={`flex-1 flex items-center justify-center gap-2 py-2 rounded-md text-xs font-bold transition-all ${
+                                        detailLevel === opt.id 
+                                        ? 'bg-white text-red-800 shadow-sm' 
+                                        : 'text-stone-400 hover:text-stone-600'
+                                    }`}
+                                >
+                                    <i className={`fas ${opt.icon}`}></i>
+                                    <span className="hidden sm:inline">{opt.label}</span>
+                                </button>
+                            ))}
+                        </div>
+
+                        {/* Text Content */}
+                        {isLoadingDetails || !contentData ? (
+                            <div className="space-y-3 animate-pulse">
+                                <div className="h-2 bg-stone-200 rounded w-full"></div>
+                                <div className="h-2 bg-stone-200 rounded w-full"></div>
+                                <div className="h-2 bg-stone-200 rounded w-3/4"></div>
                             </div>
                         ) : (
-                            <>
-                                <div className="prose prose-stone prose-lg max-w-none first-letter:text-4xl first-letter:font-serif first-letter:text-red-800 first-letter:mr-1 first-letter:float-left">
-                                    {currentDetails?.fullContent}
-                                </div>
-
-                                {/* Curiosities Grid */}
-                                {currentDetails?.curiosities && (
-                                    <div className="mt-8">
-                                        <h3 className="text-xl font-serif text-stone-800 mb-4 flex items-center gap-2">
-                                            <i className="fas fa-lightbulb text-yellow-600"></i>
-                                            Curiosità
-                                        </h3>
-                                        <div className="grid md:grid-cols-3 gap-4">
-                                            {currentDetails.curiosities.map((c, i) => (
-                                                <button 
-                                                    key={i} 
-                                                    onClick={() => setSelectedCuriosity(c)}
-                                                    className="text-left bg-stone-50 p-4 rounded-lg border border-stone-100 hover:border-red-200 hover:shadow-md hover:bg-white transition group h-full flex flex-col"
-                                                >
-                                                    <div className="text-red-800 mb-2 group-hover:scale-110 transition-transform origin-left">
-                                                        <i className="fas fa-star"></i>
-                                                    </div>
-                                                    <h4 className="font-bold text-stone-900 mb-1 leading-tight">{c.title}</h4>
-                                                    <p className="text-xs text-stone-500 line-clamp-2 mt-auto">Clicca per scoprire di più...</p>
-                                                </button>
-                                            ))}
-                                        </div>
-                                    </div>
-                                )}
-                            </>
+                            <div className="prose prose-stone text-stone-700 leading-relaxed">
+                                <p className="font-bold text-xs text-yellow-700 uppercase mb-2 tracking-wide">
+                                    <i className="fas fa-link mr-1"></i> Contesto
+                                </p>
+                                <p className="text-sm italic mb-4 bg-yellow-50 p-3 rounded-lg border border-yellow-100">
+                                    {contentData.connectionContext}
+                                </p>
+                                <p className="text-base md:text-lg">
+                                    {getCurrentText(contentData, detailLevel)}
+                                </p>
+                            </div>
                         )}
                     </div>
                 </div>
+
+                {/* Audio Curiosities */}
+                {!isLoadingDetails && contentData?.curiosities && (
+                    <div className="mb-24">
+                        <h3 className="text-sm font-bold text-stone-400 uppercase tracking-widest mb-3">Curiosità Audio</h3>
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                            {contentData.curiosities.map((c, i) => (
+                                <button 
+                                    key={i}
+                                    onClick={() => handleCuriosityClick(c)}
+                                    className="flex items-center gap-4 p-4 bg-white rounded-xl border border-stone-200 shadow-sm hover:shadow-md hover:border-red-200 transition text-left group"
+                                >
+                                    <div className="w-10 h-10 rounded-full bg-red-50 text-red-800 flex items-center justify-center group-hover:scale-110 transition">
+                                        <i className="fas fa-headphones"></i>
+                                    </div>
+                                    <div>
+                                        <h4 className="font-bold text-stone-900 text-sm">{c.title}</h4>
+                                        <p className="text-xs text-stone-400">Tocca per ascoltare</p>
+                                    </div>
+                                </button>
+                            ))}
+                        </div>
+                    </div>
+                )}
             </main>
 
-            {/* Bottom Controls */}
-            <div className="fixed bottom-0 left-0 right-0 bg-white/90 backdrop-blur-lg border-t border-stone-200 p-4 z-50 shadow-[0_-10px_40px_rgba(0,0,0,0.1)]">
-                <div className="max-w-3xl mx-auto flex flex-col gap-3">
-                    <AudioPlayer 
-                        base64Audio={currentAudio} 
-                        isLoading={loadingDetail} 
-                        onEnded={() => {}} 
-                    />
-                    
-                    <div className="flex justify-between items-center px-2">
-                        <button 
-                             onClick={() => setShowReplan(!showReplan)}
-                             className="text-stone-500 hover:text-stone-800 text-sm flex items-center gap-2"
-                        >
-                            <i className="fas fa-hourglass-half"></i>
-                            <span className="hidden md:inline">Adatta tempo</span>
-                        </button>
-
-                        <div className="flex gap-4">
-                            <button 
-                                onClick={handlePrev} 
-                                disabled={plan.currentIndex === 0}
-                                className="w-12 h-12 rounded-full bg-stone-100 text-stone-600 flex items-center justify-center hover:bg-stone-200 disabled:opacity-30 transition"
-                            >
-                                <i className="fas fa-chevron-left"></i>
-                            </button>
-                            <button 
-                                onClick={handleNext} 
-                                disabled={plan.currentIndex === plan.artworks.length - 1}
-                                className="h-12 px-6 rounded-full bg-stone-900 text-white font-serif italic hover:bg-black disabled:opacity-30 transition shadow-lg flex items-center gap-2"
-                            >
-                                <span>Prossima Opera</span>
-                                <i className="fas fa-chevron-right text-xs"></i>
-                            </button>
-                        </div>
-                    </div>
-
-                     {/* Replan Popover */}
-                     {showReplan && (
-                        <div className="absolute bottom-full left-4 mb-4 bg-white p-5 rounded-xl shadow-2xl border border-stone-200 w-72 animate-fade-in-up">
-                            <h4 className="font-serif font-bold text-stone-900 mb-1">Cambio di programma?</h4>
-                            <p className="text-xs text-stone-500 mb-4">Ricalcola il percorso in base al tempo rimasto.</p>
-                            
-                            <div className="flex items-center gap-3 mb-4">
-                                <i className="fas fa-clock text-stone-400"></i>
-                                <input 
-                                    type="range" 
-                                    min="15" 
-                                    max="180" 
-                                    step="15"
-                                    value={replanTime}
-                                    onChange={(e) => setReplanTime(parseInt(e.target.value))}
-                                    className="flex-1 h-1 bg-stone-200 rounded accent-stone-900"
-                                />
-                                <span className="font-bold font-mono text-stone-900 w-12 text-right">{replanTime}m</span>
-                            </div>
-                            
-                            <button 
-                                onClick={handleReplan}
-                                disabled={isReplanning}
-                                className="w-full py-2 bg-stone-900 text-white rounded-lg text-sm font-bold hover:bg-black disabled:bg-stone-300 transition"
-                            >
-                                {isReplanning ? 'Ricalcolo...' : 'Aggiorna Itinerario'}
-                            </button>
-                        </div>
-                    )}
-                </div>
-            </div>
-
-            {/* CURIOSITY MODAL */}
-            {selectedCuriosity && (
-                <div className="fixed inset-0 z-[60] flex items-center justify-center p-4">
-                    {/* Backdrop */}
-                    <div 
-                        className="absolute inset-0 bg-black/60 backdrop-blur-sm transition-opacity"
-                        onClick={() => setSelectedCuriosity(null)}
-                    ></div>
-                    
-                    {/* Content */}
-                    <div className="bg-white rounded-2xl p-6 md:p-8 max-w-lg w-full relative z-10 shadow-2xl animate-[fadeInUp_0.3s_ease-out]">
-                        <button 
-                            onClick={() => setSelectedCuriosity(null)}
-                            className="absolute top-4 right-4 text-stone-400 hover:text-stone-800 transition"
-                        >
-                            <i className="fas fa-times fa-lg"></i>
-                        </button>
-
-                        <div className="mb-4">
-                            <span className="inline-block bg-yellow-100 text-yellow-800 text-xs px-2 py-1 rounded font-bold uppercase tracking-wider mb-2">
-                                Lo sapevi?
-                            </span>
-                            <h3 className="text-2xl font-serif font-bold text-stone-900">
-                                {selectedCuriosity.title}
-                            </h3>
-                        </div>
-                        
-                        <div className="prose prose-stone">
-                            <p className="text-stone-600 leading-relaxed text-lg">
-                                {selectedCuriosity.description}
-                            </p>
-                        </div>
-
-                        <div className="mt-6 pt-4 border-t border-stone-100 flex justify-end">
-                            <button 
-                                onClick={() => setSelectedCuriosity(null)}
-                                className="text-sm font-bold text-red-800 hover:text-red-950 uppercase tracking-wide"
-                            >
-                                Chiudi
-                            </button>
-                        </div>
-                    </div>
-                </div>
-            )}
+            {/* GLOBAL PLAYER */}
+            <GlobalAudioPlayer 
+                track={audioState.currentTrack} 
+                onNext={handleNext}
+                onPrev={handlePrev}
+            />
         </div>
     );
 };
