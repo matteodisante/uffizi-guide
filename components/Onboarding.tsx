@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { UserProfile, UserPacing, UserInterest } from '../types';
+import { UserProfile, UserPacing, UserInterest, DetailLevel } from '../types';
 
 interface Props {
     onComplete: (profile: UserProfile) => void;
@@ -21,7 +21,12 @@ export const Onboarding: React.FC<Props> = ({ onComplete }) => {
 
     const handleNext = () => {
         if (step < 3) setStep(step + 1);
-        else onComplete({ availableTime: time, pacing, interests });
+        else onComplete({ 
+            availableTime: time, 
+            pacing, 
+            interests,
+            defaultDetailLevel: DetailLevel.MEDIUM // Set default here
+        });
     };
 
     return (
